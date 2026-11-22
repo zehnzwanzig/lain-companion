@@ -30,6 +30,21 @@ systemctl --user enable --now lain-companion.service
 
 For a different installation directory, adjust WorkingDirectory in the installed unit. Use `journalctl --user -u lain-companion.service -b` to see startup errors.
 
+## Spotify and text files
+
+Install `playerctl` and open Spotify Desktop. Ask “Welcher Song spielt gerade?” for live track metadata. Use `spotify pause`, `spotify next`, or `spotify play <Spotify track link>` to control playback.
+
+For title searches such as `Spiele Duvet von bôa`, set `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` locally. For the user service, put the assignments in `~/.config/lain-companion/spotify.env` (mode 600). Create `~/.config/systemd/user/lain-companion.service.d/spotify.conf` with:
+
+```ini
+[Service]
+EnvironmentFile=%h/.config/lain-companion/spotify.env
+```
+
+Run `systemctl --user daemon-reload` and `systemctl --user restart lain-companion.service`.
+
+Use `create file` or `edit file` to choose a UTF-8 text file and enter the contents in a local dialog.
+
 ## License and artwork
 
 The software and documentation are available under the MIT license. This unofficial fan project includes an AI-generated sprite inspired by Serial Experiments Lain. The software license grants no rights in third-party characters or designs. Ollama and downloaded models have their own licenses.

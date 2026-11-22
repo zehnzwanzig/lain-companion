@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import ast
+import re
+import base64
+import urllib.parse
 import datetime as dt
 from http.client import HTTPException
 import json
 from math import pi, sin
 from time import monotonic
+import os
+import tempfile
+import stat
 import operator
 from pathlib import Path
 import platform
@@ -22,7 +28,7 @@ import urllib.request
 from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
+    QFileDialog, QInputDialog, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
     QLabel, QPushButton, QMenu, QMessageBox, QFrame, QPlainTextEdit,
 )
 
@@ -285,6 +291,148 @@ def local_answer(question):
     return None
 
 
+SPOTIFY_ACTIONS = {
+    'play': 'play', 'pause': 'pause', 'toggle': 'play-pause',
+    'next': 'next', 'weiter': 'next', 'previous': 'previous', 'zurück': 'previous',
+    'status': 'status',
+}
+
+
+def spotify_request(question):
+    text = question.strip().rstrip('?!').strip()
+    q = text.casefold()
+    if (re.search(r'\b(welche[rsnm]?|was|what|which)\b', q)
+            and re.search(r'\b(spielt|läuft|höre|hör|playing|song|lied|track|titel)\b', q)
+            and re.search(r'\b(gerade|aktuell|moment|jetzt|currently|now|playing|läuft|spielt)\b', q)):
+        return 'status'
+    match = re.fullmatch(r'(?:spotify\s+)?(?:spiel(?:e)?|play)\s+(.+)', text, re.I)
+    if match:
+        target = re.sub(r'\s+(?:auf spotify|on spotify)$', '', match[1], flags=re.I)
+        return 'play ' + target
+    if q == 'spotify' or q.startswith('spotify '):
+        return text[7:].strip()
+    return None
+
+
+def resolve_track(target):
+    match = re.fullmatch(
+        r'(?:spotify:track:|https://open\.spotify\.com/(?:intl-[a-z]+/)?track/)'
+        r'([A-Za-z0-9]{22})(?:[?#].*)?', target)
+    if match:
+        return 'spotify:track:' + match[1], None
+    client = os.getenv('SPOTIFY_CLIENT_ID')
+    secret = os.getenv('SPOTIFY_CLIENT_SECRET')
+    if not client or not secret:
+        raise ValueError('Für Titelsuche fehlen Spotify-API-Zugangsdaten. '
+                         'Direktstart: spotify play <Spotify-Tracklink>.')
+    credentials = base64.b64encode(f'{client}:{secret}'.encode()).decode()
+    token_request = urllib.request.Request(
+        'https://accounts.spotify.com/api/token', data=b'grant_type=client_credentials',
+        headers={'Authorization': 'Basic ' + credentials})
+    with urllib.request.urlopen(token_request, timeout=8) as response:
+        token = json.load(response)['access_token']
+    parts = re.split(r'\s+(?:von|by)\s+', target, maxsplit=1, flags=re.I)
+    query = f'track:{parts[0]} artist:{parts[1]}' if len(parts) == 2 else target
+    params = urllib.parse.urlencode({'q': query, 'type': 'track', 'limit': 1})
+    request = urllib.request.Request('https://api.spotify.com/v1/search?' + params,
+                                     headers={'Authorization': 'Bearer ' + token})
+    with urllib.request.urlopen(request, timeout=8) as response:
+        tracks = json.load(response)['tracks']['items']
+    if not tracks:
+        raise ValueError('Kein passender Titel gefunden.')
+    track = tracks[0]
+    return track['uri'], track['name'] + ' – ' + ', '.join(a['name'] for a in track['artists'])
+
+
+def spotify_command(action):
+    def control(*args):
+        return subprocess.run(['playerctl', '--player=spotify', *args], check=True,
+                              capture_output=True, text=True, timeout=3).stdout.strip()
+
+    try:
+        if action.casefold() == 'status':
+            state = control('status')
+            if state == 'Stopped':
+                return 'Spotify ist gestoppt.'
+            info = control('metadata', '--format', '{{title}} | {{artist}}')
+            label = {'Playing': 'Läuft', 'Paused': 'Pausiert'}.get(state, state)
+            return f'{label}: {info}' if info.strip(' |') else f'{label}. Spotify meldet keinen Titel.'
+        if action.casefold().startswith('play '):
+            uri, name = resolve_track(action[5:].strip())
+            control('open', uri)
+            return 'An Spotify übergeben: ' + (name or uri)
+        cmd = SPOTIFY_ACTIONS.get(action.casefold())
+        if not cmd:
+            return 'Spotify: status, play, pause, toggle, next, previous, play <Titel oder Link>.'
+        control(cmd)
+        return 'Spotify: ' + cmd
+    except FileNotFoundError:
+        return 'Installiere playerctl mit sudo pacman -S playerctl.'
+    except subprocess.CalledProcessError as exc:
+        return 'Spotify: ' + (exc.stderr.strip() or 'Desktop-Player nicht erreichbar.')
+    except (OSError, HTTPException, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
+        return f'Spotify: {exc}'
+
+
+class SpotifyWorker(QThread):
+    finished_text = Signal(str)
+
+    def __init__(self, action):
+        super().__init__()
+        self.action = action
+
+    def run(self):
+        self.finished_text.emit(spotify_command(self.action))
+
+
+def edit_text_file(parent, create):
+    title = 'Create text file' if create else 'Edit text file'
+    choose = QFileDialog.getSaveFileName if create else QFileDialog.getOpenFileName
+    filename, _ = choose(parent, title, str(Path.home()))
+    if not filename:
+        return 'Cancelled.'
+    path = Path(filename)
+    try:
+        original = b''
+        if not create:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024 * 1024:
+                return 'Choose a regular UTF-8 text file up to 1 MiB.'
+            original = path.read_bytes()
+            if b'\0' in original:
+                return 'This file contains binary data.'
+        elif path.exists() or path.is_symlink():
+            return 'This file already exists. Use “edit file” to change it.'
+        encoding = 'utf-8-sig' if original.startswith(b'\xef\xbb\xbf') else 'utf-8'
+        source = original.decode(encoding)
+        newline = '\r\n' if '\r\n' in source else '\n'
+        normalized = source.replace('\r\n', '\n')
+        text, save = QInputDialog.getMultiLineText(parent, title, str(path), normalized)
+        if not save:
+            return 'Cancelled.'
+        if not create and text == normalized:
+            return 'No changes.'
+        data = text.replace('\n', newline).encode(encoding)
+        if create:
+            with path.open('xb') as output:
+                output.write(data)
+        else:
+            if path.is_symlink() or path.read_bytes() != original:
+                return 'The file changed while open. Reopen it to edit the latest version.'
+            mode = stat.S_IMODE(path.stat().st_mode)
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as output:
+                temp = Path(output.name)
+                try:
+                    output.write(data)
+                    output.flush()
+                    os.fchmod(output.fileno(), mode)
+                    os.replace(temp, path)
+                finally:
+                    temp.unlink(missing_ok=True)
+        return f'Saved {path}'
+    except (OSError, UnicodeError) as exc:
+        return f'File error: {exc}'
+
+
 class Dialogue(QWidget):
     asked = Signal(str)
     def __init__(self, owner):
@@ -537,6 +685,22 @@ class Companion(QWidget):
         if self.dialogue.isVisible(): self.dialogue.show_near()
 
     def ask(self, question):
+        command = question.strip().casefold()
+        action = spotify_request(question)
+        if action is not None:
+            if self.worker is not None:
+                self.dialogue.answer.setPlainText('Bitte warte, bis die aktuelle Anfrage fertig ist.')
+                self.dialogue.field.setText(question)
+                return
+            self.worker = SpotifyWorker(action)
+            self.worker.finished_text.connect(self.show_reply)
+            self.worker.finished.connect(self.chat_finished)
+            self.worker.start()
+            return
+        if command in ('create file', 'datei erstellen', 'edit file', 'datei bearbeiten'):
+            create = command in ('create file', 'datei erstellen')
+            self.show_reply(edit_text_file(self.dialogue, create))
+            return
         response = local_answer(question)
         if response is not None:
             self.show_reply(response)
@@ -603,3 +767,4 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+

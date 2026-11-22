@@ -2,6 +2,8 @@
 
 A small animated desktop companion for KDE Plasma. Click Lain to chat, drag her to move, or right-click to change the sprite size or Ollama model. Built-in commands handle time, system information and arithmetic. Other questions go to Ollama on your machine. Scroll through longer replies with the mouse wheel or arrow keys.
 
+![Lain in her bear pajamas beside the open desktop chat](docs/lain-companion.png)
+
 ## Install on CachyOS or Arch Linux
 
 Install Python, Bash, curl, Git and Ollama. On NVIDIA systems you can install the ollama-cuda package for GPU inference. Enable the service and download the default model:

@@ -38,7 +38,7 @@ OLLAMA_URL = 'http://127.0.0.1:11434'
 OLLAMA_START = ('Run ollama serve in a terminal, or start the installed service with\n'
                 'sudo systemctl start ollama.service.')
 DEFAULTS = {'x': None, 'y': None, 'scale': 3, 'always_on_top': True,
-            'ollama_model': 'gemma3:4b'}
+            'ollama_model': 'gemma3:4b', 'chat_provider': 'ollama'}
 
 
 def load_config():
@@ -157,6 +157,41 @@ def sprite_image(frame=0):
     if frame == 1: r(11, 44, 1, 5, lit)
     p.end()
     return img
+
+
+class CodexWorker(QThread):
+    finished_text = Signal(str)
+    failed_text = Signal(str)
+
+    def __init__(self, question):
+        super().__init__()
+        self.question = question
+
+    def run(self):
+        env = os.environ.copy()
+        for key in ('OPENAI_API_KEY', 'CODEX_API_KEY', 'SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET'):
+            env.pop(key, None)
+        env['PATH'] = env.get('PATH', os.defpath) + os.pathsep + str(Path.home() / '.local/bin')
+        local_cli = Path(__file__).resolve().parent / '.venv/bin/codex'
+        cli = str(local_cli) if local_cli.is_file() else 'codex'
+        args = [cli, 'exec', '--ephemeral', '--skip-git-repo-check',
+                '--sandbox', 'read-only', '-c', 'forced_login_method="chatgpt"',
+                '-c', 'model_provider="openai"', '-']
+        try:
+            with tempfile.TemporaryDirectory() as workdir:
+                result = subprocess.run(
+                    args, cwd=workdir, env=env, text=True, capture_output=True,
+                    input='Answer briefly as Lain, in the user’s language.\n\n' + self.question,
+                    timeout=180, check=False)
+            if result.returncode or not result.stdout.strip():
+                self.failed_text.emit('Codex konnte nicht antworten. Prüfe in Konsole: '
+                                      'codex login status. Bei Bedarf: codex login.')
+            else:
+                self.finished_text.emit(result.stdout.strip())
+        except FileNotFoundError:
+            self.failed_text.emit('Der Dienst findet codex nicht. Prüfe in Konsole: command -v codex.')
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.failed_text.emit(f'Codex: {exc}')
 
 
 class OllamaWorker(QThread):
@@ -650,6 +685,12 @@ class Companion(QWidget):
         menu = QMenu(self)
         menu.addAction('Chat with Lain', self.dialogue.show_near)
         menu.addSeparator()
+        providers = menu.addMenu('Chat-Anbieter')
+        for key, label in [('ollama', 'Ollama (lokal)'), ('codex', 'Codex (ChatGPT-Konto)')]:
+            action = providers.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self.config['chat_provider'] == key)
+            action.triggered.connect(lambda checked=False, value=key: self.set_provider(value))
         menu.addAction('Set Ollama model…', self.set_model)
         menu.addSeparator()
         size_menu = menu.addMenu('Sprite size')
@@ -661,6 +702,10 @@ class Companion(QWidget):
         menu.addSeparator()
         menu.addAction('Quit', QApplication.instance().quit)
         menu.exec(event.globalPos())
+
+    def set_provider(self, value):
+        self.config['chat_provider'] = value
+        save_config(self.config)
 
     def set_model(self):
         from PySide6.QtWidgets import QInputDialog
@@ -711,7 +756,10 @@ class Companion(QWidget):
             return
         self.speaking_until = 0.0
         self.dialogue.answer.setPlainText('Connecting to the Wired…')
-        self.worker = OllamaWorker(question, self.config['ollama_model'])
+        if self.config['chat_provider'] == 'codex':
+            self.worker = CodexWorker(question)
+        else:
+            self.worker = OllamaWorker(question, self.config['ollama_model'])
         self.worker.finished_text.connect(self.show_reply)
         self.worker.failed_text.connect(self.show_chat_error)
         self.worker.finished.connect(self.chat_finished)
@@ -767,4 +815,3 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-

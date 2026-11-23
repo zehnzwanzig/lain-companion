@@ -1,0 +1,3 @@
+PySide6>=6,<7
+
+# Codex CLI: @openai/codex (npm). Run ./install.sh to install both dependencies.

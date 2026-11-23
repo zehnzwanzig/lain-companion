@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Lain Companion, a small KDE desktop buddy powered by Ollama."""
+"""Lain Companion, a KDE desktop GUI for the Codex CLI."""
 from __future__ import annotations
 
 import ast
+from collections import deque
 import re
 import base64
+from uuid import UUID
 import urllib.parse
 import datetime as dt
 from http.client import HTTPException
@@ -18,27 +20,23 @@ import operator
 from pathlib import Path
 import platform
 import random
-import shlex
 import shutil
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 
-from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QThread, Signal, QTimer
+from PySide6.QtCore import QProcess, QEvent, QPoint, QSize, Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QFileDialog, QInputDialog, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
-    QLabel, QPushButton, QMenu, QMessageBox, QFrame, QPlainTextEdit,
+    QSizeGrip, QFileDialog, QInputDialog, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
+    QLabel, QPushButton, QMenu, QFrame, QPlainTextEdit,
 )
 
 APP_DIR = Path.home() / '.config' / 'lain-companion'
 CONFIG_PATH = APP_DIR / 'config.json'
-OLLAMA_URL = 'http://127.0.0.1:11434'
-OLLAMA_START = ('Run ollama serve in a terminal, or start the installed service with\n'
-                'sudo systemctl start ollama.service.')
-DEFAULTS = {'x': None, 'y': None, 'scale': 3, 'always_on_top': True,
-            'ollama_model': 'gemma3:4b', 'chat_provider': 'ollama'}
+DEFAULTS = {'chat_width': 355, 'chat_height': 224, 'x': None, 'y': None, 'scale': 3, 'always_on_top': True,
+            'codex_session_id': None}
 
 
 def load_config():
@@ -46,30 +44,10 @@ def load_config():
         content = json.loads(CONFIG_PATH.read_text())
         if isinstance(content, dict):
             config = {key: content.get(key, default) for key, default in DEFAULTS.items()}
-            model = config['ollama_model']
-            config['ollama_model'] = (model.strip() if isinstance(model, str) else '') or DEFAULTS['ollama_model']
             return config
     except (OSError, ValueError):
         pass
     return DEFAULTS.copy()
-
-
-def model_setup_error(model):
-    try:
-        with urllib.request.urlopen(f'{OLLAMA_URL}/api/tags', timeout=2) as response:
-            models = json.load(response)['models']
-        if not isinstance(models, list):
-            raise ValueError('Expected a model list')
-    except (OSError, HTTPException, ValueError, KeyError, TypeError):
-        return f'Could not read the Ollama model list at {OLLAMA_URL}.\n\n{OLLAMA_START}'
-
-    # Ollama treats an omitted tag as :latest. Registry ports are not tags.
-    installed_name = model if ':' in model.rsplit('/', 1)[-1] else f'{model}:latest'
-    if not any(isinstance(entry, dict) and (
-            installed_name == entry.get('name') or installed_name == entry.get('model'))
-            for entry in models):
-        return f'Ollama model {model} is missing.\n\nRun ollama pull {shlex.quote(model)}.'
-    return None
 
 
 def save_config(config):
@@ -163,9 +141,12 @@ class CodexWorker(QThread):
     finished_text = Signal(str)
     failed_text = Signal(str)
 
-    def __init__(self, question):
+    session_ready = Signal(str)
+
+    def __init__(self, question, session_id):
         super().__init__()
         self.question = question
+        self.session_id = session_id
 
     def run(self):
         env = os.environ.copy()
@@ -174,69 +155,48 @@ class CodexWorker(QThread):
         env['PATH'] = env.get('PATH', os.defpath) + os.pathsep + str(Path.home() / '.local/bin')
         local_cli = Path(__file__).resolve().parent / '.venv/bin/codex'
         cli = str(local_cli) if local_cli.is_file() else 'codex'
-        args = [cli, 'exec', '--ephemeral', '--skip-git-repo-check',
+        workdir = APP_DIR / 'codex-workspace'
+        args = [cli, 'exec', '--json', '--skip-git-repo-check',
                 '--sandbox', 'read-only', '-c', 'forced_login_method="chatgpt"',
-                '-c', 'model_provider="openai"', '-']
+                '-c', 'model_provider="openai"']
         try:
-            with tempfile.TemporaryDirectory() as workdir:
+            workdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory() as output_dir:
+                answer_file = Path(output_dir) / 'answer.txt'
+                args.extend(['--output-last-message', str(answer_file)])
+                if self.session_id:
+                    args.extend(['resume', str(UUID(str(self.session_id)))])
+                args.append('-')
                 result = subprocess.run(
                     args, cwd=workdir, env=env, text=True, capture_output=True,
                     input='Answer briefly as Lain, in the user’s language.\n\n' + self.question,
                     timeout=180, check=False)
-            if result.returncode or not result.stdout.strip():
-                self.failed_text.emit('Codex konnte nicht antworten. Prüfe in Konsole: '
-                                      'codex login status. Bei Bedarf: codex login.')
-            else:
-                self.finished_text.emit(result.stdout.strip())
+                if result.returncode:
+                    self.failed_text.emit('Codex-Anfrage fehlgeschlagen. Prüfe codex login status. '
+                                          'Ist die Sitzung gelöscht, wähle im Rechtsklick-Menü „Neuer Chat“.')
+                    return
+                thread = None
+                for line in result.stdout.splitlines():
+                    if line.strip():
+                        event = json.loads(line)
+                        if event.get('type') == 'thread.started':
+                            thread = str(UUID(event['thread_id']))
+                            break
+                if not thread or (self.session_id and thread != self.session_id):
+                    self.failed_text.emit('Codex hat die erwartete Sitzungs-ID nicht bestätigt.')
+                    return
+                answer = answer_file.read_text().strip()
+                if not answer:
+                    self.failed_text.emit('Codex hat keine Antwort geliefert.')
+                    return
+                self.session_ready.emit(thread)
+                self.finished_text.emit(answer)
+        except (ValueError, KeyError) as exc:
+            self.failed_text.emit(f'Ungültige Codex-Sitzungsdaten: {exc}. Wähle ggf. „Neuer Chat“.')
         except FileNotFoundError:
             self.failed_text.emit('Der Dienst findet codex nicht. Prüfe in Konsole: command -v codex.')
         except (OSError, subprocess.TimeoutExpired) as exc:
             self.failed_text.emit(f'Codex: {exc}')
-
-
-class OllamaWorker(QThread):
-    finished_text = Signal(str)
-    failed_text = Signal(str)
-    def __init__(self, question, model):
-        super().__init__()
-        self.question = question
-        self.model = model
-
-    def run(self):
-        body = {
-            'model': self.model,
-            'stream': False,
-            'options': {'num_predict': 110, 'temperature': 0.7},
-            'messages': [
-                {'role': 'system', 'content': (
-                    'You are a tiny quiet pixel-art desktop companion called Lain. '
-                    'Answer the user helpfully and accurately in their language. '
-                    'Use a slightly mysterious, thoughtful tone, but do not pretend '
-                    'you have access to sensors, files or tools. Keep answers under 65 words.')},
-                {'role': 'user', 'content': self.question},
-            ],
-        }
-        req = urllib.request.Request(
-            f'{OLLAMA_URL}/api/chat',
-            data=json.dumps(body).encode('utf-8'),
-            headers={'Content-Type': 'application/json'}, method='POST')
-        try:
-            with urllib.request.urlopen(req, timeout=65) as response:
-                result = json.load(response)
-            answer = result['message']['content']
-            if not isinstance(answer, str):
-                raise ValueError('Expected chat text')
-            answer = answer.strip()
-            self.finished_text.emit(answer or 'The Wired is quiet right now.')
-        except urllib.error.HTTPError as exc:
-            exc.close()
-            hint = (f'Run ollama pull {shlex.quote(self.model)}.'
-                    if exc.code == 404 else f'Ollama returned HTTP {exc.code}.')
-            self.failed_text.emit(f'Chat failed. {hint}')
-        except (OSError, HTTPException):
-            self.failed_text.emit('Could not reach Ollama. Run ollama serve or restart the service.')
-        except (ValueError, KeyError, TypeError):
-            self.failed_text.emit('Ollama returned an invalid chat response.')
 
 
 BINARY_APPS = {
@@ -287,7 +247,7 @@ def local_answer(question):
     if not q: return 'Are you there?'
     if q in ('help', 'commands', '/help', 'hilfe'):
         return ('Try: time, date, RAM, uptime, load, system, calculate 12 * 4, '
-                'open terminal, open files. I use Ollama for other questions.')
+                'open terminal, open files. I use Codex for other questions.')
     if q in ('hello', 'hi', 'hey', 'hallo', 'servus', 'lain'):
         return random.choice(['Present day... present time.', 'Hello. I am here.',
                               'Connected. What would you like to know?'])
@@ -468,7 +428,20 @@ def edit_text_file(parent, create):
         return f'File error: {exc}'
 
 
-class Dialogue(QWidget):
+class CompanionWindow(QWidget):
+    def showEvent(self, event):
+        super().showEvent(event)
+        if QApplication.platformName() == 'xcb' and shutil.which('wmctrl'):
+            # Ask KWin after Qt maps this XWayland window.
+            QTimer.singleShot(0, self.skip_taskbar)
+
+    def skip_taskbar(self):
+        if self.isVisible():
+            subprocess.run(['wmctrl', '-i', '-r', hex(int(self.winId())),
+                            '-b', 'add,skip_taskbar'], check=False)
+
+
+class Dialogue(CompanionWindow):
     asked = Signal(str)
     def __init__(self, owner):
         super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint |
@@ -476,7 +449,11 @@ class Dialogue(QWidget):
         self.owner = owner
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setObjectName('dialogue')
-        self.setFixedSize(355, 224)
+        self.setMinimumSize(300, 180)
+        self.store_size = QTimer(self)
+        self.store_size.setSingleShot(True)
+        self.store_size.timeout.connect(self.save_size)
+        self.resize(355, 224)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
         panel = QFrame()
@@ -488,6 +465,9 @@ class Dialogue(QWidget):
         top = QHBoxLayout()
         title = QLabel('LAIN // THE WIRED')
         title.setObjectName('caption')
+        upper_grip = QSizeGrip(self)
+        upper_grip.setToolTip('Resize chat')
+        top.addWidget(upper_grip, 0, Qt.AlignmentFlag.AlignTop)
         top.addWidget(title)
         top.addStretch()
         hide = QPushButton('×')
@@ -513,6 +493,9 @@ class Dialogue(QWidget):
         send.setToolTip('Ask Lain')
         send.clicked.connect(self.send_question)
         bottom.addWidget(send)
+        lower_grip = QSizeGrip(self)
+        lower_grip.setToolTip('Resize chat')
+        bottom.addWidget(lower_grip, 0, Qt.AlignmentFlag.AlignBottom)
         box.addLayout(bottom)
         self.setStyleSheet('''
             QFrame#panel { background:#2d2339; border:3px solid #cdb96a; border-radius:3px; }
@@ -553,9 +536,30 @@ class Dialogue(QWidget):
             self.field.clear()
             self.asked.emit(question)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.isVisible():
+            self.store_size.start(250)
+
+    def save_size(self):
+        config = self.owner.config
+        if (self.width(), self.height()) != (config['chat_width'], config['chat_height']):
+            config.update(chat_width=self.width(), chat_height=self.height())
+            save_config(config)
+
+    def hideEvent(self, event):
+        self.store_size.stop()
+        self.save_size()
+        super().hideEvent(event)
+
     def show_near(self):
         screen = self.owner.screen() or QApplication.primaryScreen()
         area = screen.availableGeometry()
+        if not self.isVisible():
+            width = self.owner.config['chat_width']
+            height = self.owner.config['chat_height']
+            self.resize(min(width if type(width) is int else 355, area.width()),
+                        min(height if type(height) is int else 224, area.height()))
         x = self.owner.x() + self.owner.width() + 4
         if x + self.width() > area.right(): x = self.owner.x() - self.width() - 4
         y = self.owner.y() + self.owner.height() // 2 - self.height() // 2
@@ -567,7 +571,7 @@ class Dialogue(QWidget):
         self.field.setFocus()
 
 
-class Companion(QWidget):
+class Companion(CompanionWindow):
     def __init__(self, config):
         self.config = config
         flags = Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
@@ -582,6 +586,14 @@ class Companion(QWidget):
         idle_sprite = load_idle_sprite()
         self.pixmaps = ([QPixmap.fromImage(sprite_image(i)) for i in range(3)]
                         if idle_sprite.isNull() else [idle_sprite])
+        assets = Path(__file__).resolve().parent / 'assets'
+        self.poses = {name: QPixmap(str(assets / f'lain-{name}.png'))
+                      for name in ('pc', 'sleep')}
+        self.pose = 'stand'
+        self.asleep = False
+        self.question_times = deque(maxlen=3)
+        self.pc_until = 0.0
+        self.next_pc = monotonic() + random.uniform(90, 210)
         self.resize_to_sprite()
         self.drag_from = None
         self.drag_moved = False
@@ -601,12 +613,54 @@ class Companion(QWidget):
         self.animation_started = monotonic()
         self.speaking_until = 0.0
         self.anim.start(50)
+        self.idle_monitor = QProcess(self)
+        self.idle_monitor.readyReadStandardOutput.connect(self.read_idle_state)
+        self.idle_monitor.errorOccurred.connect(
+            lambda error: print(f'Lain idle monitor: {error}', file=sys.stderr))
+        self.idle_monitor.setProcessChannelMode(QProcess.ProcessChannelMode.ForwardedErrorChannel)
+        self.idle_monitor.start('swayidle', ['-C', '/dev/null', '-w', 'timeout', '900',
+                                             'echo sleep', 'resume', 'echo awake'])
+        QApplication.instance().aboutToQuit.connect(self.idle_monitor.terminate)
+
+    def read_idle_state(self):
+        while self.idle_monitor.canReadLine():
+            state = bytes(self.idle_monitor.readLine()).strip()
+            if state == b'sleep':
+                self.asleep = True
+            elif state == b'awake':
+                self.asleep = False
+                self.next_pc = monotonic() + random.uniform(90, 210)
+        self.update_pose(monotonic())
+
+    def update_pose(self, now):
+        if self.asleep:
+            pose = 'sleep'
+        else:
+            if now >= self.next_pc:
+                self.pc_until = max(self.pc_until, now + random.uniform(15, 30))
+                self.next_pc = self.pc_until + random.uniform(90, 210)
+            pose = 'pc' if now < self.pc_until else 'stand'
+        if pose != 'stand' and self.poses[pose].isNull():
+            pose = 'stand'
+        if pose != self.pose and self.drag_from is None:
+            right = self.x() + self.width()
+            bottom = self.y() + self.height()
+            self.pose = pose
+            self.resize_to_sprite()
+            area = self.screen().availableGeometry()
+            self.move(max(area.left(), right - self.width()), max(area.top(), bottom - self.height()))
+            if self.dialogue.isVisible():
+                self.dialogue.show_near()
+            self.update()
 
     def resize_to_sprite(self):
         size = self.pixmaps[0].size().scaled(
             QSize(40 * self.scale, 64 * self.scale),
             Qt.AspectRatioMode.KeepAspectRatio,
         )
+        if self.pose != 'stand':
+            side = (54 if self.pose == 'pc' else 43) * self.scale
+            size = self.poses[self.pose].size().scaled(QSize(side, side), Qt.AspectRatioMode.KeepAspectRatio)
         self.setFixedSize(size)
 
     def startup_position(self):
@@ -635,6 +689,7 @@ class Companion(QWidget):
         return super().eventFilter(watched, event)
 
     def tick(self):
+        self.update_pose(monotonic())
         if len(self.pixmaps) > 1:
             elapsed = monotonic() - self.animation_started
             self.frame = 2 if elapsed % 5.5 < 0.15 and elapsed >= 5.5 else int(elapsed % 4 >= 2)
@@ -654,7 +709,20 @@ class Companion(QWidget):
         rect = self.rect().adjusted(0, round(lift * self.scale / 3), 0, 0)
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
-        p.drawPixmap(rect, self.pixmaps[self.frame])
+        if self.pose == 'stand':
+            p.drawPixmap(rect, self.pixmaps[self.frame])
+        elif self.pose == 'sleep':
+            breath = round((1 - sin(phase / 4)) * self.scale / 2)
+            p.drawPixmap(self.rect().adjusted(0, breath, 0, 0), self.poses['sleep'])
+        else:
+            p.drawPixmap(self.rect(), self.poses['pc'])
+            # A line grows on the CRT as Lain types, followed by a blinking cursor.
+            x, y = round(self.width() * .625), round(self.height() * .32)
+            length = int(elapsed * 6) % 11
+            dot = max(1, self.scale // 2)
+            p.fillRect(x, y, length * dot, dot, QColor('#b5e7a5'))
+            if int(elapsed * 2) % 2 == 0:
+                p.fillRect(x + (length + 1) * dot, y, dot, dot * 2, QColor('#cfffc0'))
         p.end()
 
     def mousePressEvent(self, event):
@@ -685,13 +753,8 @@ class Companion(QWidget):
         menu = QMenu(self)
         menu.addAction('Chat with Lain', self.dialogue.show_near)
         menu.addSeparator()
-        providers = menu.addMenu('Chat-Anbieter')
-        for key, label in [('ollama', 'Ollama (lokal)'), ('codex', 'Codex (ChatGPT-Konto)')]:
-            action = providers.addAction(label)
-            action.setCheckable(True)
-            action.setChecked(self.config['chat_provider'] == key)
-            action.triggered.connect(lambda checked=False, value=key: self.set_provider(value))
-        menu.addAction('Set Ollama model…', self.set_model)
+        new_chat = menu.addAction('Neuer Chat', self.new_codex_chat)
+        new_chat.setEnabled(self.worker is None)
         menu.addSeparator()
         size_menu = menu.addMenu('Sprite size')
         for scale in (2, 3, 4, 5):
@@ -703,23 +766,15 @@ class Companion(QWidget):
         menu.addAction('Quit', QApplication.instance().quit)
         menu.exec(event.globalPos())
 
-    def set_provider(self, value):
-        self.config['chat_provider'] = value
-        save_config(self.config)
+    def remember_codex_session(self, session_id):
+        if self.config['codex_session_id'] != session_id:
+            self.config['codex_session_id'] = session_id
+            save_config(self.config)
 
-    def set_model(self):
-        from PySide6.QtWidgets import QInputDialog
-        model, ok = QInputDialog.getText(self, 'Ollama model', 'Installed model name:',
-                                         text=self.config['ollama_model'])
-        model = model.strip()
-        if not ok or not model:
-            return
-        error = model_setup_error(model)
-        if error:
-            show_setup_error(error, self)
-            return
-        self.config['ollama_model'] = model
-        save_config(self.config)
+    def new_codex_chat(self):
+        self.remember_codex_session(None)
+        self.dialogue.answer.setPlainText('Neuer Codex-Chat. Was möchtest du wissen?')
+        self.dialogue.show_near()
 
     def set_scale(self, scale):
         self.scale = scale
@@ -730,6 +785,12 @@ class Companion(QWidget):
         if self.dialogue.isVisible(): self.dialogue.show_near()
 
     def ask(self, question):
+        now = monotonic()
+        self.question_times.append(now)
+        if len(self.question_times) == 3 and now - self.question_times[0] <= 120:
+            self.pc_until = max(self.pc_until, now + 90)
+        self.asleep = False
+        self.update_pose(now)
         command = question.strip().casefold()
         action = spotify_request(question)
         if action is not None:
@@ -756,10 +817,8 @@ class Companion(QWidget):
             return
         self.speaking_until = 0.0
         self.dialogue.answer.setPlainText('Connecting to the Wired…')
-        if self.config['chat_provider'] == 'codex':
-            self.worker = CodexWorker(question)
-        else:
-            self.worker = OllamaWorker(question, self.config['ollama_model'])
+        self.worker = CodexWorker(question, self.config['codex_session_id'])
+        self.worker.session_ready.connect(self.remember_codex_session)
         self.worker.finished_text.connect(self.show_reply)
         self.worker.failed_text.connect(self.show_chat_error)
         self.worker.finished.connect(self.chat_finished)
@@ -789,23 +848,31 @@ class Companion(QWidget):
         super().closeEvent(event)
 
 
-def show_setup_error(error, parent=None):
-    dialog = QMessageBox(QMessageBox.Icon.Critical, 'Ollama setup', error, parent=parent)
-    dialog.setTextFormat(Qt.TextFormat.PlainText)
-    dialog.exec()
-
-
 def main():
     app = QApplication(sys.argv)
+    from PySide6.QtGui import QIcon
+    icon = Path(__file__).resolve().parent / 'assets' / 'lain-companion-icon.png'
+    app.setWindowIcon(QIcon(str(icon)))
+    app.setDesktopFileName('lain-companion')
     app.setApplicationName('Lain Companion')
     app.setQuitOnLastWindowClosed(True)
     config = load_config()
-    error = model_setup_error(config['ollama_model'])
-    if error:
-        print(error, file=sys.stderr)
-        show_setup_error(error)
-        return 1
     buddy = Companion(config)
+    from PySide6.QtWidgets import QSystemTrayIcon
+    tray = QSystemTrayIcon(app.windowIcon(), buddy)
+    tray.setToolTip('Lain Companion')
+    menu = QMenu(buddy)
+    menu.addAction('Chat öffnen', buddy.dialogue.show_near)
+    menu.addSeparator()
+    menu.addAction('Lain beenden', app.quit)
+    tray.setContextMenu(menu)
+
+    def tray_clicked(reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            buddy.dialogue.show_near()
+
+    tray.activated.connect(tray_clicked)
+    tray.show()
     buddy.show()
     status = app.exec()
     if buddy.worker is not None:

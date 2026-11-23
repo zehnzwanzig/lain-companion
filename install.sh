@@ -20,3 +20,7 @@ else
     ln -sfn ../node_modules/.bin/codex .venv/bin/codex
 fi
 .venv/bin/codex --version
+
+data_dir="${XDG_DATA_HOME:-$HOME/.local/share}"
+install -Dm644 assets/lain-companion-icon.png "$data_dir/icons/hicolor/256x256/apps/lain-companion.png"
+install -Dm644 lain-companion.desktop "$data_dir/applications/lain-companion.desktop"

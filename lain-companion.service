@@ -1,12 +1,12 @@
 [Unit]
-Description=Lain desktop companion
+Description=Lain Companion desktop GUI for Codex CLI
 PartOf=graphical-session.target
 After=plasma-plasmashell.service
 
 [Service]
 Type=simple
 WorkingDirectory=%h/.local/opt/lain-companion
-ExecStart=/usr/bin/bash -c '/usr/bin/curl --noproxy "*" --fail --silent --show-error --output /dev/null --max-time 2 --retry 30 --retry-connrefused --retry-delay 1 http://127.0.0.1:11434/api/tags && exec ./launch.sh'
+ExecStart=/usr/bin/bash ./launch.sh
 Restart=on-abnormal
 RestartSec=5
 

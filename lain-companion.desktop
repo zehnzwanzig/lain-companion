@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Lain Companion
+Comment=Desktop GUI for the Codex CLI
+Icon=lain-companion
+Exec=systemctl --user start lain-companion.service
+Terminal=false
+Categories=Utility;

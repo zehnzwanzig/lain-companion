@@ -1,30 +1,31 @@
-# Lain Companion
+# Lain Companion — a desktop GUI for Codex CLI
 
-A small animated desktop companion for KDE Plasma. Click Lain to chat, drag her to move, or right-click to change the sprite size or Ollama model. Built-in commands handle time, system information and arithmetic. Other questions go to your selected chat provider. Ollama is the default. Scroll through longer replies with the mouse wheel or arrow keys.
+Lain Companion wraps the OpenAI Codex CLI in a small PySide6 chat window for KDE Plasma. Click Lain or her tray icon to ask Codex a question using your ChatGPT account. Follow-up questions stay in the same Codex session, even after restarting the widget. The default Codex workspace is read-only.
+
+Drag Lain to move her, resize the chat using its corner grips, or choose **Neuer Chat** from her context menu to start over. Three questions within two minutes send Lain to her pixel-art PC. She occasionally sits there on her own, and curls up to sleep after 15 minutes without desktop input. Move the mouse or press a key to wake her.
 
 ![Lain in her bear pajamas beside the open desktop chat](docs/lain-companion.png)
 
 ## Install on CachyOS or Arch Linux
 
-Install Python, Bash, curl, Git and Ollama. Install npm if you do not already have the Codex CLI. On NVIDIA systems you can install the ollama-cuda package for GPU inference. Enable the service and download the default model:
+Install Python, Bash and Git. On Plasma Wayland, install `swayidle` for sleep/wake detection, `wmctrl` for taskbar integration, and `playerctl` for Spotify controls. Install npm if you do not already have the Codex CLI.
 
 ```sh
-sudo systemctl enable --now ollama.service
-ollama pull gemma3:4b
 mkdir -p ~/.local/opt
 git clone https://github.com/zehnzwanzig/lain-companion.git ~/.local/opt/lain-companion
 cd ~/.local/opt/lain-companion
 ./install.sh
+.venv/bin/codex login
 ./launch.sh
 ```
 
-The installer creates a Python virtual environment with PySide6. The launcher uses XWayland under Plasma Wayland to support window placement. Preferences are stored in `~/.config/lain-companion/config.json`. If an earlier installation requests a missing model, set its `ollama_model` entry to an installed tag.
+The installer creates a Python virtual environment with PySide6. The launcher uses XWayland under Plasma Wayland to support window placement. Preferences are stored in `~/.config/lain-companion/config.json`.
 
 ## Codex with your ChatGPT account
 
 Run `./install.sh` after updating. It installs PySide6 from `requirements.txt` and reuses an existing Codex CLI. If needed, it installs the official npm package from `requirements-npm.txt` inside the project’s virtual environment.
 
-Run `.venv/bin/codex login status` in the project directory. To sign in, run `.venv/bin/codex login` and choose ChatGPT. Restart the widget, then right-click Lain and select **Chat-Anbieter → Codex (ChatGPT-Konto)**. Each chat question starts a fresh online session. Spotify and file commands still run locally. Ollama is required at startup even when Codex is selected.
+Run `.venv/bin/codex login status` in the project directory. To sign in, run `.venv/bin/codex login` and choose ChatGPT. Lain resumes its Codex conversation across restarts. Right-click Lain and select **Neuer Chat** to start a fresh conversation. Spotify and file commands run locally.
 
 ## Start at login
 
@@ -55,4 +56,4 @@ Use `create file` or `edit file` to choose a UTF-8 text file and enter the conte
 
 ## License and artwork
 
-The software and documentation are available under the MIT license. This unofficial fan project includes an AI-generated sprite inspired by Serial Experiments Lain. The software license grants no rights in third-party characters or designs. Ollama and downloaded models have their own licenses.
+The software and documentation are available under the MIT license. This unofficial fan project includes AI-generated companion sprites and a portrait icon inspired by Serial Experiments Lain. The software license grants no rights in third-party characters or designs.
